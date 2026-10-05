@@ -11,6 +11,7 @@ import importlib.util
 import math
 import os
 import random
+import sys
 
 FAILURE_SCORE = -10.0
 
@@ -32,6 +33,7 @@ def evaluate(program_path):
     try:
         spec = importlib.util.spec_from_file_location("candidate", program_path)
         mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod   # as a normal import would; @dataclass looks it up
         spec.loader.exec_module(mod)
         pred = [float(v) for v in mod.fit_predict(list(x_tr), list(y_tr), list(x_te))]
         if len(pred) != len(y_te) or not all(math.isfinite(v) for v in pred):

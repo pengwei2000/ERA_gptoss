@@ -145,6 +145,28 @@ class ContextWindow(unittest.TestCase):
             if chars == 128_511:
                 self.assertGreater(cap, 12_000)
 
+    def test_reply_beyond_the_window_counts_as_truncated(self):
+        # max_tokens comes from a character estimate, which a token-dense prompt
+        # can beat. The server's usage is exact: a reply that would not have fit
+        # a 49152-token vLLM context must not become a program, or ERA would get
+        # more tokens than the window it is compared under.
+        def reply(prompt_tokens, completion_tokens):
+            return 200, {}, json.dumps({
+                "choices": [{"message": {"content": "code"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": prompt_tokens,
+                          "completion_tokens": completion_tokens}}).encode()
+        srv = _Server([reply(7107, 45832), reply(7107, 42045)])
+        try:
+            c = _client(srv.base)
+            over_code, over = c.draw_sample_with_info("p")
+            fit_code, fit = c.draw_sample_with_info("p")
+        finally:
+            srv.close()
+        self.assertEqual((over_code, over["finish_reason"], over["over_context_tokens"],
+                          over["attempts"]), ("", "length", 3787, 1))   # not retried
+        self.assertEqual((fit_code, fit["finish_reason"]), ("code", "stop"))   # exactly 49152
+        self.assertNotIn("over_context_tokens", fit)
+
     def test_no_window_sends_max_tokens_unchanged(self):
         srv = _Server([_ok("x")])
         try:
@@ -211,6 +233,25 @@ class Retries(unittest.TestCase):
             finally:
                 srv.close()
             self.assertEqual(len(srv.requests), 1, status)
+
+    def test_wrong_field_types_are_malformed_and_retried(self):
+        # A 200 with fields of the wrong type is a broken reply like any other:
+        # it must be retried, not crash the run on the first request.
+        def body(message, usage):
+            return 200, {}, json.dumps({"choices": [{"message": message,
+                                                      "finish_reason": "stop"}],
+                                        "usage": usage}).encode()
+        srv = _Server([body({"content": 42}, {}),
+                       body({"content": "ok"}, "unknown"),
+                       body({"content": "ok"}, {"prompt_tokens": "7107"}),
+                       body({"content": "ok", "reasoning_content": {"a": 1}}, {}),
+                       _ok("y = 2")])
+        try:
+            code, info = _client(srv.base, max_attempts=6).draw_sample_with_info("p")
+        finally:
+            srv.close()
+        self.assertEqual((code, info["attempts"]), ("y = 2", 5))
+        self.assertTrue(all("malformed" in e for e in info["errors"]))
 
     def test_empty_answer_is_returned_not_retried(self):
         # e.g. the reasoning used the whole budget: that is the model's answer,

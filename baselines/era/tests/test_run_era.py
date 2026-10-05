@@ -120,6 +120,41 @@ class Executor(unittest.TestCase):
             score, info = self._run(src)
             self.assertEqual(score, float("-inf"), name)
 
+    def test_a_non_dict_result_fails_even_after_a_json_looking_line(self):
+        # The runner prints evaluate()'s result last. If the evaluator returns
+        # None, an earlier line the candidate printed must not become the score.
+        score, info = self._run(
+            "import json\n"
+            "def evaluate(p):\n"
+            "    print(json.dumps({'combined_score': 999}))\n"
+            "    return None\n")
+        self.assertEqual(score, float("-inf"))
+        self.assertIn("NoneType", info["metrics"]["error"])
+
+    def test_output_after_the_result_line_still_finds_it(self):
+        # ...while output printed after the runner's line (here an atexit
+        # handler) is skipped, as SimpleTES does.
+        score, _ = self._run(
+            "import atexit\n"
+            "atexit.register(print, 'bye')\n"
+            "def evaluate(p):\n"
+            "    return {'combined_score': -0.5}\n")
+        self.assertEqual(score, -0.5)
+
+    def test_timeout_does_not_wait_for_a_descendant_holding_stdout(self):
+        # A descendant that escapes the kill (its own session on POSIX; orphaned
+        # from the process tree on Windows) keeps the stdout pipe open. Cleanup
+        # must not wait for it, or one stuck candidate stalls the serial search.
+        score, info = self._run(
+            "import subprocess, sys, time\n"
+            "LAUNCH = ('import os, subprocess, sys; subprocess.Popen([sys.executable, \"-c\", '\n"
+            "          '\"import time; time.sleep(30)\"], start_new_session=(os.name != \"nt\"))')\n"
+            "def evaluate(p):\n"
+            "    subprocess.run([sys.executable, '-c', LAUNCH])   # its child outlives it\n"
+            "    time.sleep(60)\n", timeout=1)
+        self.assertEqual(info["metrics"]["error"], "timeout")
+        self.assertLess(info["eval_wall_s"], 15)
+
     def test_timeout_kills_and_scores_minus_inf(self):
         score, info = self._run("import time\ndef evaluate(p):\n    time.sleep(60)\n", timeout=2)
         self.assertEqual(score, float("-inf"))
@@ -138,6 +173,86 @@ class Executor(unittest.TestCase):
     def test_real_score_passes_through(self):
         score, _ = self._run("def evaluate(p):\n    return {'combined_score': -0.0271}\n")
         self.assertTrue(math.isclose(score, -0.0271))
+
+    def test_windows_venv_layout_is_found(self):
+        # --eval-venv must accept a standard Windows venv (Scripts/python.exe).
+        venv = tempfile.mkdtemp()
+        os.makedirs(os.path.join(venv, "Scripts"))
+        open(os.path.join(venv, "Scripts", "python.exe"), "w").close()
+        self.assertEqual(run_era._venv_python(venv),
+                         os.path.join(venv, "Scripts", "python.exe"))
+        os.makedirs(os.path.join(venv, "bin"))
+        open(os.path.join(venv, "bin", "python"), "w").close()
+        self.assertEqual(run_era._venv_python(venv), os.path.join(venv, "bin", "python"))
+
+
+class ResumeSettings(unittest.TestCase):
+    """--resume must refuse to mix two evaluation environments in one tree."""
+
+    def _main(self, d, *extra):
+        for name, text in (("evaluator.py", "def evaluate(p):\n    return {'combined_score': 1}\n"),
+                           ("init.py", "x = 1\n"), ("task.txt", "task\n")):
+            with open(os.path.join(d, name), "w") as f:
+                f.write(text)
+        argv = ["--init-program", os.path.join(d, "init.py"),
+                "--evaluator", os.path.join(d, "evaluator.py"),
+                "--instruction", os.path.join(d, "task.txt"),
+                "--output-dir", os.path.join(d, "out"), "--max-nodes", "0",
+                "--api-base", "http://127.0.0.1:9/v1", *extra]
+        with mock.patch.dict(os.environ, {"AKASHML_API_KEY": "dummy"}), \
+                redirect_stdout(io.StringIO()):
+            return run_era.main(argv)
+
+    def _set_recorded_python(self, d, value):
+        path = os.path.join(d, "out", "config.json")
+        with open(path) as f:
+            config = json.load(f)
+        config["eval_python"] = value
+        with open(path, "w") as f:
+            json.dump(config, f)
+
+    def test_a_different_evaluation_interpreter_is_refused(self):
+        d = tempfile.mkdtemp()
+        self.assertEqual(self._main(d), 0)
+        self._set_recorded_python(d, os.path.join(d, "other-venv", "bin", "python"))
+        self.assertEqual(self._main(d, "--resume"), 2)
+
+    def test_the_same_interpreter_recorded_as_a_relative_path_is_accepted(self):
+        # Runs launched from the repo root record e.g. datasets/x/.venv/bin/python.
+        d = tempfile.mkdtemp()
+        self.assertEqual(self._main(d), 0)
+        cwd = os.getcwd()
+        os.chdir(os.path.dirname(sys.executable))
+        try:
+            self._set_recorded_python(d, os.path.join(".", os.path.basename(sys.executable)))
+            self.assertEqual(self._main(d, "--resume"), 0)
+        finally:
+            os.chdir(cwd)
+
+
+class ToyTask(unittest.TestCase):
+    def test_a_valid_dataclass_candidate_is_scored(self):
+        # The evaluator must load the candidate like an import: a correct program
+        # using @dataclass with postponed annotations is not a failed node.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "toy_evaluator", os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "toy_task", "evaluator.py"))
+        toy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(toy)
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "cand.py")
+        with open(path, "w") as f:
+            f.write("from __future__ import annotations\n"
+                    "from dataclasses import dataclass\n"
+                    "@dataclass\n"
+                    "class Mean:\n"
+                    "    value: float\n"
+                    "def fit_predict(x_tr, y_tr, x_te):\n"
+                    "    m = Mean(sum(y_tr) / len(y_tr))\n"
+                    "    return [m.value for _ in x_te]\n")
+        result = toy.evaluate(path)
+        self.assertEqual(result["validity"], 1.0, result.get("error"))
 
 
 class RootGuard(unittest.TestCase):

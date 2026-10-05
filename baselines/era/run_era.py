@@ -244,10 +244,12 @@ class EvaluatorExecutor:
 
     Mirrors SimpleTES's EvaluatorWorker: per-eval scratch dir as cwd and
     TMPDIR, new session so a timeout kills the whole process tree, last JSON
-    line of stdout is the result, non-zero exit / timeout -> -inf. One
-    deliberate difference: API-key variables are removed from the child
-    environment so candidate code (and, through sbatch --export=ALL, the SLURM
-    worker) never sees the LLM key.
+    line of stdout is the result, non-zero exit / timeout -> -inf. Deliberate
+    differences: API-key variables are removed from the child environment so
+    candidate code (and, through sbatch --export=ALL, the SLURM worker) never
+    sees the LLM key; a last line that is JSON but not a dict (evaluate()
+    returned None, a list, ...) is a failure rather than a cue to look further
+    up for a JSON line.
     """
 
     def __init__(self, evaluator_path, python_executable, timeout, scratch_dir, api_key_env):
@@ -283,7 +285,7 @@ class EvaluatorExecutor:
                 stdout, stderr = proc.communicate(timeout=self.timeout)
             except subprocess.TimeoutExpired:
                 _kill_group(proc)
-                proc.communicate()
+                _reap(proc)
                 metrics = {"error": "timeout", "combined_score": float("-inf")}
             except BaseException:     # e.g. KeyboardInterrupt during the root eval
                 _kill_group(proc)
@@ -321,15 +323,38 @@ def _kill_group(proc):
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except (AttributeError, ProcessLookupError, PermissionError, OSError):
+        if os.name == "nt":   # no process groups: take down the runner's process tree
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, check=False)
         try:
             proc.kill()
         except OSError:
             pass
 
 
+def _reap(proc, grace=10.0):
+    """Wait for the killed runner itself, not for its pipes (as SimpleTES does
+    with proc.wait()): a descendant that left its process group can hold stdout
+    open long after the runner is gone. The pipes are not closed here: on
+    Windows a reader thread from communicate() may still hold them, and closing
+    would wait for that descendant after all; they close when proc is released."""
+    try:
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _parse_last_json(text):
     if not text:
         return {"error": "Empty evaluator output", "combined_score": float("-inf")}
+    # The runner prints evaluate()'s result as the last line. If that line is
+    # JSON it is the result, whatever its type: an evaluator returning None must
+    # fail, not fall back to an earlier JSON-looking line the candidate printed.
+    # Otherwise (output after the runner's print) scan back like SimpleTES does.
+    try:
+        return json.loads(text.rsplit("\n", 1)[-1].strip())
+    except json.JSONDecodeError:
+        pass
     for line in reversed(text.split("\n")):
         line = line.strip()
         if line.startswith("{") and line.endswith("}"):
@@ -493,7 +518,25 @@ class RunLog:
 # silently mix two experiments in one tree, so it is refused.
 FINGERPRINT_KEYS = ("init_program_sha256", "evaluator_sha256", "instruction_sha256",
                     "model", "api_base", "temperature", "top_p", "max_tokens",
-                    "context_window", "reasoning_effort", "c_puct", "eval_timeout")
+                    "context_window", "reasoning_effort", "c_puct", "eval_timeout",
+                    "eval_python")
+
+
+def _setting(key, value):
+    # eval_python may be stored relative to the run's working directory; compare
+    # it as an absolute path without resolving symlinks (venvs link one base python).
+    if key == "eval_python" and isinstance(value, str) and os.path.dirname(value):
+        return os.path.normcase(os.path.abspath(value))
+    return value
+
+
+def _venv_python(venv):
+    """The venv's interpreter: bin/python (POSIX) or Scripts/python.exe (Windows)."""
+    for parts in (("bin", "python"), ("Scripts", "python.exe")):
+        path = os.path.join(venv, *parts)
+        if os.path.exists(path):
+            return path
+    return os.path.join(venv, "bin", "python")
 
 
 # ---------------------------------------------------------------------------
@@ -584,8 +627,7 @@ def main(argv=None):
         print(f"[era] environment variable {args.api_key_env} is not set "
               f"(e.g.  read -rs {args.api_key_env} && export {args.api_key_env})")
         return 2
-    eval_python = (os.path.join(args.eval_venv, "bin", "python") if args.eval_venv
-                   else sys.executable)
+    eval_python = _venv_python(args.eval_venv) if args.eval_venv else sys.executable
     if not os.path.exists(eval_python):
         print(f"[era] evaluation python not found: {eval_python}")
         return 2
@@ -636,7 +678,7 @@ def main(argv=None):
         with open(config_path, encoding="utf-8") as f:
             first = json.load(f)
         changed = {k: (first.get(k), config[k]) for k in FINGERPRINT_KEYS
-                   if first.get(k) != config[k]}
+                   if _setting(k, first.get(k)) != _setting(k, config[k])}
         if changed:
             print(f"[era] refusing to resume: experiment settings differ from the "
                   f"original run: {changed}")

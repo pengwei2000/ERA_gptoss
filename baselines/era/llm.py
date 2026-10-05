@@ -181,6 +181,15 @@ class OpenAICompatLLM:
                     if parsed is not None:
                         content, meta = parsed
                         self._learn_prompt_size(full_prompt, meta.get("prompt_tokens"))
+                        over = self._over_context(meta)
+                        if over > 0:
+                            # max_tokens came from an estimate; a server with this
+                            # context (SimpleTES's vLLM) would have cut the reply
+                            # here, so treat it as truncated: no answer.
+                            self.log(f"  [llm] reply exceeds the {self.context_window}-token "
+                                     f"context by {over} tokens; counted as truncated")
+                            content = ""
+                            meta.update(finish_reason="length", over_context_tokens=over)
                         meta.update(attempts=attempt, latency_s=round(time.time() - t0, 2),
                                     total_s=round(time.time() - t_start, 2), errors=errors,
                                     max_tokens_sent=body["max_tokens"])
@@ -215,6 +224,14 @@ class OpenAICompatLLM:
         per_char = self._tokens_per_char or _INITIAL_TOKENS_PER_CHAR
         prompt_tokens = int(len(full_prompt) * per_char) + _TEMPLATE_TOKENS
         return max(1, min(self.max_tokens, self.context_window - prompt_tokens))
+
+    def _over_context(self, meta: Dict[str, Any]) -> int:
+        """Tokens by which prompt + completion, as the server counted them, exceed
+        the context window (0 if within it, or if usage was not reported)."""
+        p, c = meta.get("prompt_tokens"), meta.get("completion_tokens")
+        if not self.context_window or not isinstance(p, int) or not isinstance(c, int):
+            return 0
+        return max(0, p + c - self.context_window)
 
     def _learn_prompt_size(self, full_prompt: str, prompt_tokens: Optional[int]) -> None:
         if isinstance(prompt_tokens, int) and prompt_tokens > 0 and full_prompt:
@@ -279,9 +296,17 @@ def _parse_completion(raw: bytes) -> Optional[Tuple[str, Dict[str, Any]]]:
         return None
     if not isinstance(message, dict):
         return None
-    content = message.get("content") or ""
-    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
-    usage = data.get("usage") or {}
+    content = message.get("content")
+    reasoning = message.get("reasoning_content") or message.get("reasoning")
+    usage = data.get("usage")
+    if usage is None:
+        usage = {}
+    if (not isinstance(content, (str, type(None))) or not isinstance(reasoning, (str, type(None)))
+            or not isinstance(usage, dict)
+            or any(isinstance(usage.get(k), bool) or not isinstance(usage.get(k), (int, type(None)))
+                   for k in ("prompt_tokens", "completion_tokens"))):
+        return None   # wrong field types: malformed, retried like any other bad body
+    content, reasoning = content or "", reasoning or ""
     return content, {
         "finish_reason": choice.get("finish_reason"),
         "prompt_tokens": usage.get("prompt_tokens"),
