@@ -1,0 +1,28 @@
+You are an expert in numerical methods.
+
+## Problem
+
+Fit a one-dimensional regression model. You are given 200 noisy training
+samples (x, y) of an unknown smooth function on [-3, 3] and must predict y at
+200 held-out test points on the same interval.
+
+## Function Signature
+
+```python
+def fit_predict(x_train, y_train, x_test):
+    # x_train, y_train, x_test: lists of Python floats
+    # return: list of float predictions, one per element of x_test
+    ...
+```
+
+## Scoring
+
+combined_score = -RMSE on the held-out test points (higher is better).
+A program that raises, returns the wrong length, or returns non-finite values
+gets combined_score = -10.0.
+
+## Constraints
+
+- Pure Python standard library only (no numpy, scipy, sklearn).
+- fit_predict must return within 10 seconds.
+- No file or network I/O.
